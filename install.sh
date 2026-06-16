@@ -40,6 +40,13 @@ chmod 700 "$INSTALL_DIR"
 # ---------- copy launcher ----------
 install -m 755 "$LAUNCHER_SRC" "$INSTALL_DIR/ollacc"
 
+# ---------- copy lib/ (sources the launcher needs at runtime) ----------
+LIB_SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+if [ -d "$LIB_SRC" ]; then
+    install -d "$INSTALL_DIR/lib"
+    install -m 644 "$LIB_SRC"/* "$INSTALL_DIR/lib/"
+fi
+
 # ---------- copy conf example (reference, not sourced) ----------
 if [ -f "$EXAMPLE_SRC" ]; then
     install -m 644 "$EXAMPLE_SRC" "$INSTALL_DIR/ollacc.conf.example"
