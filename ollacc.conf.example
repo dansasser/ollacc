@@ -1,0 +1,16 @@
+# ollacc.conf.example
+# Reference template — copied to ~/.ollacc/ollacc.conf.example by install.sh.
+# The actual runtime config lives at ~/.ollacc/config (chmod 600, sourced by the launcher).
+# Edit the live config directly if you prefer; comments here are documentation only.
+
+# Ollama Cloud API key — generate at https://ollama.com/settings/keys
+# (Leave empty to be prompted on first run.)
+ANTHROPIC_AUTH_TOKEN=""
+
+# Anthropic SDK base URL. Must be the bare host — the SDK appends /v1/messages,
+# so no trailing slash and no /api/ path.
+ANTHROPIC_BASE_URL="https://ollama.com"
+
+# Default model. Leave empty to always show the model menu.
+# (Set automatically when you choose "make this my default" in the menu.)
+OLLAMA_CLAUDE_DEFAULT_MODEL=""

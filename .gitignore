@@ -1,0 +1,12 @@
+# Defensive: a user-created runtime config dir could end up in-tree
+# if the repo is cloned into ~ or opened in an editor that follows the
+# .ollacc symlink. Never commit it.
+.ollacc/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

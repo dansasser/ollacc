@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# ollacc — Ollama Cloud Claude Code launcher
+# Sources ~/.ollacc/config, prompts for key if missing, shows a top-10 model menu
+# scraped from ollama.com/search?c=cloud (intersected with the user's auth'd
+# cloud catalog), and launches `claude` with the chosen model.
+
+set -u
+OLLACC_HOME="${OLLACC_HOME:-$HOME/.ollacc}"
+OLLACC_CONFIG="$OLLACC_HOME/config"
+
+# ---------- helpers ----------
+die() { echo "ollacc: $*" >&2; exit 1; }
+
+# Write or replace a single bash-var assignment in $OLLACC_CONFIG while
+# preserving comments and unrelated lines.
+config_set() {
+    local key="$1" value="$2"
+    mkdir -p "$OLLACC_HOME"
+    touch "$OLLACC_CONFIG"
+    chmod 600 "$OLLACC_CONFIG"
+    if grep -qE "^[[:space:]]*${key}=" "$OLLACC_CONFIG"; then
+        # Replace existing line
+        local tmp
+        tmp=$(mktemp)
+        awk -v k="$key" -v v="$value" '
+            BEGIN { done = 0 }
+            /^[[:space:]]*#/ { print; next }
+            {
+                if (!done && $0 ~ "^[[:space:]]*" k "=") {
+                    print k "=\"" v "\""
+                    done = 1
+                } else {
+                    print
+                }
+            }
+            END { if (!done) print k "=\"" v "\"" }
+        ' "$OLLACC_CONFIG" > "$tmp" && mv "$tmp" "$OLLACC_CONFIG"
+    else
+        printf '%s="%s"\n' "$key" "$value" >> "$OLLACC_CONFIG"
+    fi
+    chmod 600 "$OLLACC_CONFIG"
+}
+
+config_unset() {
+    local key="$1"
+    [ -f "$OLLACC_CONFIG" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    awk -v k="$key" '
+        /^[[:space:]]*#/ { print; next }
+        $0 ~ "^[[:space:]]*" k "=" { next }
+        { print }
+    ' "$OLLACC_CONFIG" > "$tmp" && mv "$tmp" "$OLLACC_CONFIG"
+    chmod 600 "$OLLACC_CONFIG"
+}
+
+# ---------- pre-flight: shell out early on the management flags ----------
+# Handle these BEFORE sourcing config / asking for the key, so the user can
+# always reset state regardless of where they are in the flow.
+case "${1:-}" in
+    --model-clear)
+        if [ -f "$OLLACC_CONFIG" ]; then
+            config_unset OLLAMA_CLAUDE_DEFAULT_MODEL
+            echo "✓ Default model cleared. Next run will show the model menu."
+        else
+            echo "✓ No config exists; nothing to clear."
+        fi
+        exit 0
+        ;;
+    --key-clear)
+        if [ -f "$OLLACC_CONFIG" ]; then
+            config_unset ANTHROPIC_AUTH_TOKEN
+            echo "✓ API key cleared. Next run will prompt for a new key."
+        else
+            echo "✓ No config exists; nothing to clear."
+        fi
+        exit 0
+        ;;
+esac
+
+# ---------- load config ----------
+if [ -f "$OLLACC_CONFIG" ]; then
+    # shellcheck disable=SC1090
+    . "$OLLACC_CONFIG"
+fi
+: "${ANTHROPIC_BASE_URL:=https://ollama.com}"
+
+# ---------- no-key splash + prompt ----------
+if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+    cat <<'EOF'
+=============================================
+  🔑 Ollama Cloud API Key Required
+=============================================
+ollacc needs an Ollama Cloud API key to connect.
+
+How to get one:
+  1. Open https://ollama.com/settings/keys in your browser
+  2. Click "Generate API Key"
+  3. Copy the key
+
+You can either:
+  (a) Paste it at the prompt below, OR
+  (b) Edit the config file directly:
+      ~/.ollacc/config
+      (set ANTHROPIC_AUTH_TOKEN="<your-key>")
+
+The key is stored with chmod 600 (only you can read it).
+=============================================
+EOF
+    read -r -s -p "Paste key (input is hidden): " NEW_KEY
+    echo
+    if [ -z "$NEW_KEY" ]; then
+        die "No key provided. Aborting."
+    fi
+    config_set ANTHROPIC_AUTH_TOKEN "$NEW_KEY"
+    ANTHROPIC_AUTH_TOKEN="$NEW_KEY"
+    cat <<'EOF'
+=============================================
+  ✓ Key saved to ~/.ollacc/config
+=============================================
+Continuing to model selection…
+=============================================
+EOF
+fi
+
+# ---------- export for the SDK ----------
+export ANTHROPIC_BASE_URL
+export ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_API_KEY=""  # per Ollama issue #13854 — must be empty
+
+# ---------- fetch auth'd catalog (needed by both fast path and menu) ----------
+authd_json=$(curl -s -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "https://ollama.com/api/tags")
+
+# ---------- determine model ----------
+MODEL=""
+
+# If a default is set AND user didn't pass --model on CLI, try the fast path
+if [ -n "${OLLAMA_CLAUDE_DEFAULT_MODEL:-}" ] && [ "${1:-}" != "--model" ]; then
+    DEFAULT="$OLLAMA_CLAUDE_DEFAULT_MODEL"
+    if [[ "$authd_json" == *"\"name\":\"$DEFAULT\""* ]]; then
+        echo "Using default: $DEFAULT"
+        exec claude --model "$DEFAULT" "${@}"
+    else
+        echo "⚠️  Default model '$DEFAULT' is no longer in your cloud catalog. Showing menu…"
+    fi
+fi
+
+# ---------- scrape the popular ordering from ollama.com ----------
+scrape_html=$(curl -s "https://ollama.com/search?c=cloud")
+
+# ---------- intersect with auth'd catalog ----------
+MAPFILE=()
+# Popular order loop
+remaining_scrape="$scrape_html"
+while [[ "$remaining_scrape" =~ href=\"/library/([^\"/]+)\" ]]; do
+    candidate="${BASH_REMATCH[1]}"
+    if [[ ! " ${MAPFILE[*]} " =~ " ${candidate} " ]] \
+       && [[ "$authd_json" == *"\"name\":\"$candidate\""* ]]; then
+        MAPFILE+=("$candidate")
+    fi
+    remaining_scrape="${remaining_scrape#*href=\"/library/}"
+    [ ${#MAPFILE[@]} -eq 10 ] && break
+done
+
+# Fallback: if scraping produced nothing usable, show auth'd catalog order
+if [ ${#MAPFILE[@]} -eq 0 ]; then
+    echo "⚠️ Could not fetch popular ordering; using auth'd catalog order."
+    remaining_json="$authd_json"
+    while [[ "$remaining_json" =~ \"name\":\"([^\"]+)\" ]]; do
+        m="${BASH_REMATCH[1]}"
+        if [[ ! " ${MAPFILE[*]} " =~ " ${m} " ]]; then
+            MAPFILE+=("$m")
+        fi
+        remaining_json="${remaining_json#*\"name\"}"
+        [ ${#MAPFILE[@]} -eq 10 ] && break
+    done
+fi
+
+# Last-resort fallback
+if [ ${#MAPFILE[@]} -eq 0 ]; then
+    echo "⚠️ Could not reach ollama.com at all. Using last-known defaults."
+    MAPFILE=("kimi-k2.7-code" "minimax-m3" "qwen3.5" "glm-5.1" "minimax-m2.7")
+fi
+
+# ---------- show menu ----------
+clear
+echo "============================================="
+echo "   🤖 ollacc - Ollama Cloud Claude Code     "
+echo "============================================="
+echo "Select a cloud model to run:"
+echo "---------------------------------------------"
+
+for i in "${!MAPFILE[@]}"; do
+    printf "%2d) %s\n" "$((i+1))" "${MAPFILE[$i]}"
+done
+
+CUSTOM_INDEX=$(( ${#MAPFILE[@]} + 1 ))
+printf "%2d) [Custom] Enter your own model name\n" "$CUSTOM_INDEX"
+echo "============================================="
+
+read -r -p "Enter choice (1-$CUSTOM_INDEX): " choice
+
+# Validate as integer FIRST so non-numeric input (e.g. "c") doesn't get
+# evaluated as a variable name inside `[[ ... -ge ... ]]` under `set -u`.
+if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [[ "$choice" -ge 1 && "$choice" -le "${#MAPFILE[@]}" ]]; then
+        MODEL="${MAPFILE[$((choice-1))]}"
+    elif [[ "$choice" -eq "$CUSTOM_INDEX" ]]; then
+        echo ""
+        read -r -p "➡️ Enter custom model name: " CUSTOM_MODEL
+        MODEL="${CUSTOM_MODEL:-minimax-m3}"
+    else
+        echo "❌ Invalid choice. Defaulting to first available model."
+        MODEL="${MAPFILE[0]}"
+    fi
+else
+    echo "❌ Invalid choice. Defaulting to first available model."
+    MODEL="${MAPFILE[0]}"
+fi
+
+# ---------- save-default prompt ----------
+# Skip the prompt if the user picked the existing default
+if [ "$MODEL" != "${OLLAMA_CLAUDE_DEFAULT_MODEL:-}" ]; then
+    read -r -p "💾 Make \"$MODEL\" your default model? [y/N]: " SAVE_DEFAULT
+    case "$SAVE_DEFAULT" in
+        y|Y|yes|YES)
+            config_set OLLAMA_CLAUDE_DEFAULT_MODEL "$MODEL"
+            echo "✓ Default set to: $MODEL"
+            ;;
+        *)
+            echo "(Not saved as default)"
+            ;;
+    esac
+fi
+
+echo ""
+echo "🚀 Target Model: $MODEL"
+echo "🔗 Connecting session..."
+echo "---------------------------------------------"
+
+# Forward any user-supplied flags to claude
+exec claude --model "$MODEL" "$@"
