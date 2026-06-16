@@ -42,7 +42,11 @@ catalog_resolve
 MODEL=""
 if [ -n "${OLLAMA_CLAUDE_DEFAULT_MODEL:-}" ] && [ "${1:-}" != "--model" ]; then
     local_fast_default="$OLLAMA_CLAUDE_DEFAULT_MODEL"
-    if [[ "$authd_json" == *"\"name\":\"$local_fast_default\""* ]]; then
+    # Use grep -qF for a literal substring check: the [[ == *"..."* ]] form
+    # is globby on the outer *'s even when the variable is quoted, so a
+    # custom model name containing * or ? would misbehave. -F is fixed-string,
+    # -q is silent-and-exit-on-match. (See lib/catalog.sh for the same pattern.)
+    if printf '%s' "$authd_json" | grep -qF "\"name\":\"$local_fast_default\""; then
         echo "Using default: $local_fast_default"
         exec claude --model "$local_fast_default" "${@}"
     else

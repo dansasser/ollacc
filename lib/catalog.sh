@@ -2,6 +2,12 @@
 # Produces a global array MAPFILE (top 10 model names) and the global
 # $authd_json (raw response from /api/tags). Caller must have
 # $ANTHROPIC_AUTH_TOKEN set and exported before calling.
+#
+# Sources lib/config.sh for bash_escape (catalog-loop membership check
+# must treat the candidate as a literal substring, not a glob).
+
+# shellcheck source=lib/config.sh
+. "${BASH_SOURCE%/*}/config.sh"
 
 # authd_json — raw response from https://ollama.com/api/tags (auth'd).
 # Populated by catalog_resolve.
@@ -15,19 +21,39 @@ declare -a MAPFILE=()
 # intersect them, fall back to auth'd-catalog order, then to a hardcoded
 # last-resort list. Sets the globals $authd_json and MAPFILE.
 catalog_resolve() {
+    # Always start clean — the function may be called more than once per run
+    # (e.g. after a future --refresh-catalog or --model-clear flow).
+    MAPFILE=()
+    authd_json=""
+
     # 1. Auth'd catalog (Bearer token)
-    authd_json=$(curl -s -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "https://ollama.com/api/tags")
+    # -sf: silent + fail-on-HTTP-error (so 4xx/5xx become empty body, not error text
+    #       concatenated to the body that we'd then try to JSON-grep).
+    # --max-time/--connect-timeout: bound the wait so a hung ollama.com doesn't
+    #       stall the launcher; on timeout we fall through to the last-resort list.
+    if ! authd_json=$(curl -sf --max-time 10 --connect-timeout 5 \
+            -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+            "https://ollama.com/api/tags"); then
+        authd_json=""
+    fi
 
     # 2. Popular-order scrape
     local scrape_html
-    scrape_html=$(curl -s "https://ollama.com/search?c=cloud")
+    if ! scrape_html=$(curl -sf --max-time 10 --connect-timeout 5 \
+            "https://ollama.com/search?c=cloud"); then
+        scrape_html=""
+    fi
 
-    # 3. Intersect: keep popular-order slugs that exist in the auth'd catalog
+    # 3. Intersect: keep popular-order slugs that exist in the auth'd catalog.
+    # The candidate may contain glob metacharacters (e.g. a model named "foo*");
+    # build a glob-safe needle and use grep -F for a literal substring check
+    # rather than the [[ == *"$x"* ]] pattern (which is globby on the outer *'s
+    # even when $x is quoted).
     local remaining_scrape="$scrape_html"
     while [[ "$remaining_scrape" =~ href=\"/library/([^\"/]+)\" ]]; do
         local candidate="${BASH_REMATCH[1]}"
         if [[ ! " ${MAPFILE[*]} " =~ " ${candidate} " ]] \
-           && [[ "$authd_json" == *"\"name\":\"$candidate\""* ]]; then
+           && printf '%s' "$authd_json" | grep -qF "\"name\":\"$candidate\""; then
             MAPFILE+=("$candidate")
         fi
         remaining_scrape="${remaining_scrape#*href=\"/library/}"
